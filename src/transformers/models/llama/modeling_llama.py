@@ -28,6 +28,8 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+from deepspeed.ops.sparse_attention import SparseSelfAttention, FixedSparsityConfig
+
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...modeling_attn_mask_utils import (
@@ -68,6 +70,53 @@ if is_torch_fx_available():
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
+
+
+def get_deepspeed_config(args):
+    if hasattr(args, 'deepspeed') and args.deepspeed:
+        from deepspeed import DeepSpeedConfig
+        return DeepSpeedConfig(args.deepspeed)
+    else:
+        raise RuntimeError('deepspeed is not found in args.')
+
+
+def get_sparse_attention_config(args, num_heads):
+    if args.deepspeed_sparse_attention:
+        ds_config = get_deepspeed_config(args)
+        if hasattr(ds_config,
+                   'sparse_attention') and ds_config.sparse_attention:
+            sa_config = ds_config.sparse_attention
+            sa_mode = sa_config.get('mode')
+            if (sa_mode == 'dense'):
+                from deepspeed.ops.sparse_attention import DenseSparsityConfig as STConfig
+            elif (sa_mode == 'fixed'):
+                from deepspeed.ops.sparse_attention import FixedSparsityConfig as STConfig
+            elif (sa_mode == 'bigbird'):
+                from deepspeed.ops.sparse_attention import BigBirdSparsityConfig as STConfig
+            elif (sa_mode == 'bslongformer'):
+                from deepspeed.ops.sparse_attention import BSLongformerSparsityConfig as STConfig
+            elif (sa_mode == 'variable'):
+                from deepspeed.ops.sparse_attention import VariableSparsityConfig as STConfig
+            else:
+                raise NotImplementedError(
+                    f'Given sparsity mode, {sa_mode}, has not been implemented yet!'
+                )
+            del sa_config['mode']
+            return STConfig(num_heads=num_heads, **sa_config)
+        else:
+            from deepspeed.ops.sparse_attention import FixedSparsityConfig as STConfig
+            print(
+                'deepspeed sparse attention is not set; Fixed sparsity is used as default.'
+            )
+            return STConfig(num_heads=num_heads)
+    else:
+        return None
+
+def get_sparse_attention_utils(sparse_attention_config):
+    if sparse_attention_config is not None:
+        from deepspeed.ops.sparse_attention import SparseAttentionUtils
+        return SparseAttentionUtils
+    return None
 
 
 def _get_unpad_data(attention_mask):
@@ -743,19 +792,155 @@ class LlamaSdpaAttention(LlamaAttention):
         return attn_output, None, past_key_value
 
 
+class LlamaSparseAttention(nn.Module):
+    """
+    Llama attention module using sparse attention. 
+    """
+
+    def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None, sparsity_config=FixedSparsityConfig(num_heads=4)):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        if layer_idx is None:
+            logger.warning_once(
+                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
+                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
+                "when creating this class."
+            )
+
+        self.attention_dropout = config.attention_dropout
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.is_causal = True
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+
+        self.sparse_self_attention = SparseSelfAttention(sparsity_config)
+
+        self._init_rope()
+
+    def _init_rope(self):
+        if self.config.rope_scaling is None:
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=self.rope_theta,
+            )
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                )
+            elif scaling_type == "dynamic":
+                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    scaling_factor=scaling_factor,
+                    base=self.rope_theta,
+                )
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_output = self.sparse_self_attention(query_states, key_states, value_states, key_padding_mask=attention_mask)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
+    "sparse_attention": LlamaSparseAttention,
     "flash_attention_2": LlamaFlashAttention2,
     "sdpa": LlamaSdpaAttention,
 }
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig, layer_idx: int, sparse_attention_config=None):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        if sparse_attention_config is not None:
+            self.self_attn = LlamaSparseAttention(config=config, layer_idx=layer_idx, sparsity_config=sparse_attention_config)
+        else:
+            self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -852,6 +1037,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
+    _supports_sparse_attn = True
     _supports_cache_class = True
 
     def _init_weights(self, module):
@@ -953,12 +1139,18 @@ class LlamaModel(LlamaPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
+        # set sparse_attention_config if it has been selected
+        self.sparse_attention_config = get_sparse_attention_config(
+            config, config.num_attention_heads)
+        self.sparse_attention_utils = get_sparse_attention_utils(self.sparse_attention_config)
+
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+            [LlamaDecoderLayer(config, layer_idx, sparse_attention_config=self.sparse_attention_config) for layer_idx in range(config.num_hidden_layers)]
+        )            
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        self._use_sparse_attention = self.sparse_attention_config is not None
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
@@ -1038,6 +1230,26 @@ class LlamaModel(LlamaPreTrainedModel):
                 inputs_embeds,
                 past_key_values_length,
             )
+        elif self._use_sparse_attention:
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            token_type_ids = torch.zeros_like(input_ids)
+
+            # 4d mask is passed through the layers
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+            )
+
+            # If LlamaDecoder uses sparse attention, it needs to be padded based on the sparse attention block size
+            pad_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds = self.sparse_attention_utils.pad_to_block_size(
+                block_size=self.sparse_attention_config.block,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pad_token_id=self.padding_idx,
+                model_embeddings=self.embed_tokens)
         else:
             # 4d mask is passed through the layers
             attention_mask = _prepare_4d_causal_attention_mask(
@@ -1093,6 +1305,10 @@ class LlamaModel(LlamaPreTrainedModel):
         next_cache = None
         if use_cache:
             next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
+        # If LlamaDecoder uses sparse attention, and input_ids were padded, sequence output needs to be unpadded to original length
+        if self.sparse_attention_config is not None and pad_len > 0:
+            hidden_states = self.sparse_attention_utils.unpad_sequence_output(
+                pad_len, hidden_states)
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
