@@ -643,6 +643,10 @@ def is_flash_attn_2_available():
         return version.parse(importlib.metadata.version("flash_attn")) >= version.parse("2.0.4")
     else:
         return False
+    
+
+def is_deepspeed_available():
+    return _is_package_available("deepspeed")
 
 
 def is_flash_attn_greater_or_equal_2_10():

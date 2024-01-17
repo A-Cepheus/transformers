@@ -28,8 +28,6 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from deepspeed.ops.sparse_attention import SparseSelfAttention, FixedSparsityConfig
-
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...modeling_attn_mask_utils import (
@@ -46,6 +44,7 @@ from ...utils import (
     add_start_docstrings_to_model_forward,
     is_flash_attn_2_available,
     is_flash_attn_greater_or_equal_2_10,
+    is_deepspeed_available,
     logging,
     replace_return_docstrings,
 )
@@ -56,6 +55,10 @@ from .configuration_llama import LlamaConfig
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+
+
+if is_deepspeed_available():
+    from deepspeed.ops.sparse_attention import SparseSelfAttention, FixedSparsityConfig
 
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
